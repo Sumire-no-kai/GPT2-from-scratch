@@ -258,10 +258,23 @@
   - 本机（M5 / 3060）写代码、跑测试和小规模调试；正式训练放到 Colab。调试不在云上做，避免空耗额度。
   - Colab：用户通过 Google AI Pro 获得 Colab Pro，已确认能连上 A100。实测 A100 每小时约 5.3 个计算单元，当前余额约 198 个，约合每月 37 个 A100 小时。Colab FAQ 说明 Google AI 方案的计算单元每月发放；每月数量、是否过期或累积，以账号内显示为准。
   - 124M 预训练估算（未实测）：做了阶段 6 的加速（bf16、`scaled_dot_product_attention`、`torch.compile`）后，单张 A100 约 15–20 万 token/秒，100 亿 token 约 14–19 小时、约 75–100 个单元，一个月的额度够用；不做加速会慢数倍，超出额度。所以 124M 预训练排在阶段 6 之后。
-  - 访问方式：优先用 Google 官方的 Colab CLI（2026-06 发布，`colab exec` / `colab run` 把本地脚本放到远程 runtime 运行），其次是官方 VS Code 扩展；网页 Notebook 也可以只当启动器（`!git clone`、`!python -m ...`）。不用 SSH：Colab 本身不提供 SSH，常见做法依赖 ngrok 等隧道，而 FAQ 对所有方案都禁止连接远程代理。CLI 的命令参数以安装后的 `colab --help` 为准，尚未实际试用。
+  - 访问方式：用 Google 官方的 Colab CLI（2026-06 发布）。`colab run` 把本地脚本放到新开的远程 runtime 上运行，结束后自动关机；需要交互时可用官方的 `colab ssh`（加 `--rm` 断开即关机）。备选是官方 VS Code 扩展，网页 Notebook 也可以只当启动器。不自己搭 ngrok 等隧道：FAQ 对所有方案都禁止连接远程代理。
   - AWS：用户有 $200 额度（很可能是新账号 Free Tier，需升级到付费计划才能用 GPU 实例，注册后 12 个月内有效）。单张 H100（p5.4xlarge）约 $6.88/小时，新账号的 GPU 配额默认通常为 0。目前作为备用，不申请。
 - **约束**：Colab 会话会断开，断开后文件丢失，所以训练必须支持从 checkpoint 恢复，checkpoint 存到 Google Drive。Colab 的 A100 可能只有 40 GB 显存，需要更小的 micro batch 加梯度累积。数据（FineWeb-Edu 约 100 亿 token，切好后约 20 GB）在本机或 Colab 的 CPU 运行时上 tokenize，存进 Google Drive，不占用 A100 时间。Colab 的 PyTorch 版本不一定是 2.14.1，结果不要求与本机逐位一致。
 - **待办**：
-  - 下次连上 A100 时运行 `nvidia-smi`，确认显存是 40 GB 还是 80 GB。
   - 观察一个月后计算单元的刷新和累积方式。
-  - 第一次上 Colab 时，先装 Colab CLI，用阶段 0 的 bigram 试跑，把流程走通。
+  - 第一次正式上 Colab 训练时，先用阶段 0 的 bigram 试跑，把上传代码、挂载 Drive、下载 checkpoint 的流程走通。
+
+## 2026-10-20 Colab CLI 实测
+
+- 安装：本机没有 `uv`，用 `pip install --user google-colab-cli` 装在用户目录，版本 0.7.4；可执行文件在 `~/Library/Python/3.13/bin/colab`，不在 PATH 中（是否加入 PATH 由用户决定）。只支持 macOS / Linux，Windows 那台 3060 用不了。
+- 登录：0.7.4 默认用 OAuth（README 写的默认 adc 已过时），使用包内自带的公开 OAuth 客户端，不需要另外配置。第一次运行时打开授权链接、粘贴授权码，令牌缓存在 `~/.config/colab-cli/token.json`。申请的权限包括 openid、profile、email、cloud-platform、colaboratory、drive.file。登录由用户本人完成。
+- 实测：`colab run --gpu A100 --timeout 300 check_gpu.py`（检查脚本在 scratchpad，不进仓库）从开机、运行到关机共约 13 秒，结束后 `colab sessions` 为空，余额显示仍为 198.56。
+  - GPU：NVIDIA A100-SXM4-40GB，显存 40 GB（40960 MiB），支持 bf16；驱动 580.82.07，CUDA 13.0。
+  - PyTorch：Colab 自带 2.11.0+cu130，低于本项目固定的 2.14.1。训练前需决定：用 `colab install` 装 2.14.1 的 CUDA 构建，还是直接用自带版本；代码只用常规功能，两者都可以，但结果不要求与本机逐位一致。
+- 影响：显存是 40 GB 而不是 Karpathy 用的 80 GB，124M 预训练要用更小的 micro batch 加梯度累积来达到同样的有效 batch，速度会略慢。
+- 训练时要注意（来自 0.7.4 的 `--help`）：
+  - `colab run` / `colab exec` 的 `--timeout` 默认只有 30 秒，训练脚本要设成数小时。
+  - 它们只上传单个脚本文件，不同步目录：要在脚本里 `git clone` 仓库，或用 `colab upload` 传文件。
+  - `colab drivemount` 需要人工交互；拿回文件用 `colab download`；远程工作目录是 `/content`。
+  - 闲置会话照样扣费：用 `colab run`（不加 `--keep`）或 `colab ssh --rm`，用完确认 `colab sessions` 为空。
