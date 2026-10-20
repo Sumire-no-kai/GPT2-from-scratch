@@ -271,10 +271,24 @@
 - 登录：0.7.4 默认用 OAuth（README 写的默认 adc 已过时），使用包内自带的公开 OAuth 客户端，不需要另外配置。第一次运行时打开授权链接、粘贴授权码，令牌缓存在 `~/.config/colab-cli/token.json`。申请的权限包括 openid、profile、email、cloud-platform、colaboratory、drive.file。登录由用户本人完成。
 - 实测：`colab run --gpu A100 --timeout 300 check_gpu.py`（检查脚本在 scratchpad，不进仓库）从开机、运行到关机共约 13 秒，结束后 `colab sessions` 为空，余额显示仍为 198.56。
   - GPU：NVIDIA A100-SXM4-40GB，显存 40 GB（40960 MiB），支持 bf16；驱动 580.82.07，CUDA 13.0。
-  - PyTorch：Colab 自带 2.11.0+cu130，低于本项目固定的 2.14.1。训练前需决定：用 `colab install` 装 2.14.1 的 CUDA 构建，还是直接用自带版本；代码只用常规功能，两者都可以，但结果不要求与本机逐位一致。
+  - PyTorch：Colab 自带 2.11.0+cu130，低于本项目固定的 2.14.1。决定在 Colab 上统一装 2.14.1，见下方"Colab 训练前的固定步骤"。
 - 影响：显存是 40 GB 而不是 Karpathy 用的 80 GB，124M 预训练要用更小的 micro batch 加梯度累积来达到同样的有效 batch，速度会略慢。
 - 训练时要注意（来自 0.7.4 的 `--help`）：
   - `colab run` / `colab exec` 的 `--timeout` 默认只有 30 秒，训练脚本要设成数小时。
   - 它们只上传单个脚本文件，不同步目录：要在脚本里 `git clone` 仓库，或用 `colab upload` 传文件。
   - `colab drivemount` 需要人工交互；拿回文件用 `colab download`；远程工作目录是 `/content`。
   - 闲置会话照样扣费：用 `colab run`（不加 `--keep`）或 `colab ssh --rm`，用完确认 `colab sessions` 为空。
+- 本机已把 `~/Library/Python/3.13/bin` 追加到 `~/.zprofile` 的 PATH 末尾（用户同意；原文件备份为 `~/.zprofile.bak-colab`），终端里可以直接用 `colab`。
+
+### Colab 训练前的固定步骤
+
+每次在 Colab 上正式训练前都要做（会话断开后远程文件全部丢失，所以每次新开机器都要重来）：
+
+1. 装与本机一致的 PyTorch：`pip install "torch==2.14.1+cu130" --index-url https://download.pytorch.org/whl/cu130`。选 cu130，因为它和 Colab 的 CUDA 13.0 驱动、自带 PyTorch 的构建方式一致；cu126（Windows 3060 用的构建）也可用。已确认官方索引中有 Linux x86_64、Python 3.12 / 3.13 的安装包；实际在 Colab 上安装尚未试过，第一次使用时验证。
+2. 安装后新开一个 Python 进程再导入 torch，并打印 `torch.__version__` 确认是 2.14.1；同一进程里已导入的 2.11 不会被替换。
+3. 获取代码：在脚本里 `git clone` 仓库，或用 `colab upload` 上传（`colab run` 只上传单个脚本）。
+4. 需要保存 checkpoint 时，先由用户运行 `colab drivemount`（需要人工交互）。
+5. `--timeout` 设成训练所需的时长（默认只有 30 秒）。
+6. 结束后确认 `colab sessions` 为空、`colab usage` 的使用率为 0。
+
+安装包加 CUDA 库有几个 GB，每次下载约一两分钟，按每小时 5.3 个单元计不到 0.2 个单元。不装也能用自带的 2.11（代码只用常规功能），统一版本是为了少一个排查问题时的变数。无论哪个版本，A100 和 Mac 的结果都不要求逐位一致。
