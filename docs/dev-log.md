@@ -7,9 +7,9 @@
 ## 当前状态
 
 - 前置知识大纲已整理至 [`prerequisites.md`](prerequisites.md)，可按学习时机和掌握标准准备。
-- 阶段 0（bigram 热身）已完成：28 项检查通过；`main` 在 tiny Shakespeare 上 3000 步把 loss 从 4.73 降到 2.46（验证集 2.49），MPS 上约 5 秒，正常退出。阶段 0 笔记已按零基础读者重写。学习路线已于 2026-10-10 修订。
-- 已提供字符编码骨架与 7 项检查用例；问答笔记开头包含完整任务约定，后续再逐步加入数据分批、模型、训练与生成。
-- 阶段 0–6 的问答记录放在 `notes/qa/`，按提问顺序维护；阶段 0 已记录字符编码与 bigram 热身的目标、原因和意义。
+- 阶段 0（bigram 热身）已完成并合并到 master（PR #1–#4）：28 项检查通过；`main` 在 tiny Shakespeare 上 3000 步把 loss 从 4.73 降到 2.46（验证集 2.49），MPS 上约 5 秒。下一步是阶段 1（tokenizer）。
+- 阶段笔记放在 `notes/qa/`，面向零基础读者；阶段 0 已完成，阶段 1–6 为占位。
+- 训练平台（2026-10-20 定）：本机写代码和调试；正式训练用 Colab Pro 的 A100（Google AI Pro 附带，实测每小时约 5.3 个计算单元，每月约 198 个）；AWS 的 $200 额度备用。学习路线于 2026-10-10、2026-10-20 修订。
 - 本地使用 PyCharm 创建的 `.venv`（Python 3.13.5），已安装 PyTorch 2.14.1 和 NumPy 2.5.3；CPU / MPS 的基础运算与自动求导验证通过。
 - 跨平台基线固定为 Python 3.13、PyTorch 2.14.1、NumPy 2.5.3；Mac 使用 MPS，Windows RTX 3060 使用 CUDA 12.6 构建，待 Windows 实机验证。
 - 同步范围已确认：项目文档、协作约定和依赖配置纳入版本管理，`.idea/` 与 `.venv/` 留在本地。
@@ -40,8 +40,8 @@
 | 2 | 模型结构：`wte`/`wpe` → 多头因果自注意力 → Transformer block → 完整模型 | Q/K/V、因果遮罩、多头注意力、MLP（GELU 的 tanh 近似）、Pre-LayerNorm、残差、`ln_f`、`lm_head` 与 `wte` 共享权重 | 各层 tensor 形状正确并有标注；参数量为 124,439,808；改动第 t 个位置之后的 token，前 t 个位置的 logits 不变 |
 | 3 | 加载官方 GPT-2 124M 权重 | 参数名映射、Conv1D 权重需要转置、数值误差、与参考实现对照 | CPU float32 下，同一输入的 logits 与参考实现一致（`atol≈1e-4`） |
 | 4 | 生成：输入提示词，输出续写 | 自回归生成、temperature、top-k、top-p | greedy 解码与参考实现逐 token 一致；固定随机种子下，采样满足预期性质（如 top-k 之外的 token 概率为 0）；加载权重后能生成通顺的英文 |
-| 5 | 小规模训练：数据读取、训练与验证、保存和恢复 checkpoint | AdamW、warmup + cosine 学习率、梯度裁剪、梯度累积、过拟合 | 在相同可见上下文不对应冲突目标的固定小 batch 上过拟合，loss 接近 0；检查训练与验证 loss 的趋势；同一后端、可复现设置下，从 checkpoint 恢复后（含优化器状态、随机数状态及数据迭代位置），与不中断训练的结果在约定容差内一致 |
-| 6 | 性能优化与进阶（可选）：KV cache、`scaled_dot_product_attention`、混合精度、`torch.compile`、微调、HellaSwag 评测 | 性能测量、显存管理 | 用测量证明确实更快；结果保持正确，例如开启 KV cache 后 greedy 输出与不开时完全一致 |
+| 5 | 小规模训练：数据读取、训练与验证、保存和恢复 checkpoint。训练目标：字符级小 GPT（约 6 层、384 维、上下文 256）在 tiny Shakespeare 上训练，与阶段 0 的 bigram（验证 loss 2.49）对比；进阶可选：用阶段 1 的 GPT-2 tokenizer 在 TinyStories 上训练小模型 | AdamW、warmup + cosine 学习率、梯度裁剪、梯度累积、过拟合 | 在相同可见上下文不对应冲突目标的固定小 batch 上过拟合，loss 接近 0；检查训练与验证 loss 的趋势；同一后端、可复现设置下，从 checkpoint 恢复后（含优化器状态、随机数状态及数据迭代位置），与不中断训练的结果在约定容差内一致 |
+| 6 | 性能优化与进阶（可选）：KV cache、`scaled_dot_product_attention`、混合精度、`torch.compile`、在官方 124M 权重上微调（如 Shakespeare）、HellaSwag 评测；最终可选目标：在 Colab A100 上从头预训练 124M（约 100 亿 token，分段续训） | 性能测量、显存管理、断点续训 | 用测量证明确实更快；结果保持正确，例如开启 KV cache 后 greedy 输出与不开时完全一致。124M 预训练：正式开跑前试跑约 100 步，测出 token/s 和计算单元消耗；完成后在同一验证集上与官方 124M 对比 loss |
 | 7 | 保留拓展（可选，阶段 6 之后再定）：int8 / 4-bit 量化；大模型规模的工程问题（分布式训练、大规模数据处理、推理部署）；对齐训练（指令微调、RLHF） | 量化与混合精度的区别、并行训练方式、从续写模型到对话模型的过程 | 到时根据兴趣另定 |
 
 主要参考资料：OpenAI 的 GPT-2 仓库和论文，以及 Andrej Karpathy 的 *Let's reproduce GPT-2 (124M)* 视频和 `nanoGPT` / `build-nanogpt` 仓库。
@@ -243,3 +243,25 @@
 - 用户在 GitHub 上看渲染效果后提出：问答标题和回答一眼分不清。改为标题前加按小节的编号（如 Q3.2），回答以 **A：** 开头；嵌套的追问写作「Q9.5 追问：」。
 - 按小节编号而不是全文连续编号：某一节以后新增问题时，其他节的编号不变，编号本身也能看出在第几节。
 - 回答本身以粗体开头时，`**A：**` 后加空格，避免两个粗体标记相连导致渲染出错。写作约定同步到 `notes/README.md` 和 `AGENTS.md`。
+
+## 2026-10-20 训练目标与训练平台
+
+本条取代 2026-10-10 的"待定：是否租 GPU 从零训练 124M"。
+
+- **训练目标**（写入学习路线阶段 5、6）：
+  - 阶段 5 主目标：字符级小 GPT（参考 nanoGPT 的 shakespeare-char：6 层、384 维、6 头、上下文 256，约 1000 万参数），在 tiny Shakespeare 上训练。数据与阶段 0 相同，能直接和 bigram 对比，看出注意力带来的变化；Karpathy 在 A100 上的参考结果为验证 loss 约 1.47、约 3 分钟。
+  - 阶段 5 进阶（可选）：用阶段 1 的 GPT-2 tokenizer，在 TinyStories 上训练小模型，目标是生成通顺的简单英文故事。注意 50257 的词表让 `wte` 在 384 维下就有约 1900 万参数，占小模型的大头。
+  - 阶段 6：在官方 124M 权重上微调（如 Shakespeare），计算量小、效果最好。
+  - 阶段 6 之后的最终可选目标：从头预训练 124M。
+  - 放弃：用 3060 从头训练 124M，能跑的训练量太少，效果远不如官方权重，学到的东西也不比上面几项多。
+- **训练平台**：
+  - 本机（M5 / 3060）写代码、跑测试和小规模调试；正式训练放到 Colab。调试不在云上做，避免空耗额度。
+  - Colab：用户通过 Google AI Pro 获得 Colab Pro，已确认能连上 A100。实测 A100 每小时约 5.3 个计算单元，当前余额约 198 个，约合每月 37 个 A100 小时。Colab FAQ 说明 Google AI 方案的计算单元每月发放；每月数量、是否过期或累积，以账号内显示为准。
+  - 124M 预训练估算（未实测）：做了阶段 6 的加速（bf16、`scaled_dot_product_attention`、`torch.compile`）后，单张 A100 约 15–20 万 token/秒，100 亿 token 约 14–19 小时、约 75–100 个单元，一个月的额度够用；不做加速会慢数倍，超出额度。所以 124M 预训练排在阶段 6 之后。
+  - 访问方式：优先用 Google 官方的 Colab CLI（2026-06 发布，`colab exec` / `colab run` 把本地脚本放到远程 runtime 运行），其次是官方 VS Code 扩展；网页 Notebook 也可以只当启动器（`!git clone`、`!python -m ...`）。不用 SSH：Colab 本身不提供 SSH，常见做法依赖 ngrok 等隧道，而 FAQ 对所有方案都禁止连接远程代理。CLI 的命令参数以安装后的 `colab --help` 为准，尚未实际试用。
+  - AWS：用户有 $200 额度（很可能是新账号 Free Tier，需升级到付费计划才能用 GPU 实例，注册后 12 个月内有效）。单张 H100（p5.4xlarge）约 $6.88/小时，新账号的 GPU 配额默认通常为 0。目前作为备用，不申请。
+- **约束**：Colab 会话会断开，断开后文件丢失，所以训练必须支持从 checkpoint 恢复，checkpoint 存到 Google Drive。Colab 的 A100 可能只有 40 GB 显存，需要更小的 micro batch 加梯度累积。数据（FineWeb-Edu 约 100 亿 token，切好后约 20 GB）在本机或 Colab 的 CPU 运行时上 tokenize，存进 Google Drive，不占用 A100 时间。Colab 的 PyTorch 版本不一定是 2.14.1，结果不要求与本机逐位一致。
+- **待办**：
+  - 下次连上 A100 时运行 `nvidia-smi`，确认显存是 40 GB 还是 80 GB。
+  - 观察一个月后计算单元的刷新和累积方式。
+  - 第一次上 Colab 时，先装 Colab CLI，用阶段 0 的 bigram 试跑，把流程走通。
