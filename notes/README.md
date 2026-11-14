@@ -40,4 +40,4 @@
 - [阶段 3：加载预训练权重](qa/03-weights.md)
 - [阶段 4：文本生成](qa/04-generation.md)
 - [阶段 5：小规模训练](qa/05-training.md)
-- [阶段 6：性能优化与进阶](qa/06-performance.md)
+- [阶段 6：训练加速与 124M 预训练](qa/06-performance.md)
