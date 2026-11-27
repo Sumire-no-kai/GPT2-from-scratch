@@ -16,7 +16,7 @@ status: draft
 
 - 若组装字典后调用 `load_state_dict(..., strict=True)`，把两个键都映射到官方的同一份 `wte` 张量，并保留默认的 `assign=False`。只提供一个键时，严格加载仍会报告另一个键缺失。
 - 若逐参数加载，用 `torch.no_grad()` 包住 `model.embeddings.wte.weight.copy_(official_wte)`，原地拷贝一次即可。`lm_head` 也会读到新的数值。
-- 加载后同时检查数值与参数身份。`model.lm_head.weight is model.embeddings.wte.weight` 应为 `True`。
+- 加载后同时检查数值，以及两者是否仍是同一个参数对象：`model.lm_head.weight is model.embeddings.wte.weight` 应为 `True`。
 
 ## 延伸问答
 
