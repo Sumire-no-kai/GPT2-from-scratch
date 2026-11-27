@@ -204,3 +204,87 @@ class GPT2(nn.Module):
             x = block(x)  # (B, T, C)
         x = self.ln_f(x)  # (B, T, C)
         return self.lm_head(x)  # (B, T, V)
+
+    # 每轮用最近的上下文预测一个 token，选出编号后追加到完整序列。
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        """为每段输入续写 max_new_tokens 个 token，默认每轮贪心选择。
+
+        input_ids 是形状 (B, T) 的非空整数张量，与模型在同一设备上。
+        返回 (B, T + max_new_tokens)，保留原提示词和编号类型。
+        超出位置表容量时，前向只读取最近的 token，返回值仍保留完整序列。
+        do_sample=True 时缩放分数并按 top_k、top_p 的顺序限制抽样候选。
+        temperature 须为有限正数，top_k 为正整数或 None，top_p 须在 (0, 1]。
+        """
+        if input_ids.ndim != 2 or input_ids.numel() == 0:
+            raise ValueError("input_ids must have nonempty shape (batch_size, sequence_length)")
+        if input_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("input_ids must have dtype torch.int32 or torch.int64")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if do_sample:
+            if not math.isfinite(temperature) or temperature <= 0:
+                raise ValueError("temperature must be finite and positive")
+            if top_k is not None and (type(top_k) is not int or top_k <= 0):
+                raise ValueError("top_k must be a positive integer or None")
+            if not 0 < top_p <= 1:
+                raise ValueError("top_p must be in (0, 1]")
+
+        max_context = self.embeddings.wpe.num_embeddings
+        for _ in range(max_new_tokens):
+            # 只裁剪本轮送入模型的窗口，保留需要返回的完整 input_ids。
+            context = input_ids[:, -max_context:]  # (B, min(当前长度, max_context))
+            logits = self(context)  # (B, 窗口长度, V)
+            last_logits = logits[:, -1, :]  # (B, V)
+            if do_sample:
+                next_ids = self._sample_next_token(last_logits, temperature, top_k, top_p)  # (B, 1)
+            else:
+                next_ids = last_logits.argmax(dim=-1, keepdim=True)  # (B, 1)
+            input_ids = torch.cat((input_ids, next_ids.to(input_ids.dtype)), dim=1)  # (B, 当前长度 + 1)
+
+        return input_ids  # (B, T + max_new_tokens)
+
+    # 先调分数，再屏蔽候选，最后从每行的归一化概率中抽一个编号。
+    @staticmethod
+    def _sample_next_token(
+        logits: torch.Tensor, temperature: float, top_k: int | None, top_p: float
+    ) -> torch.Tensor:
+        """从 (B, V) 的分数按温度、top-k、top-p 抽样，返回 (B, 1) 的编号。"""
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            logits = logits.float()  # (B, V)，用 float32 算概率和累计概率。
+        if temperature != 1.0:
+            # 同行分数减去最大值后再缩放，防止低温时最大分数溢出。
+            centered = logits - logits.amax(dim=-1, keepdim=True)  # (B, V)
+            # 保留最大分数对应的 0，即使温度小到当前精度下的除法溢出。
+            logits = (centered / temperature).masked_fill(centered == 0, 0.0)  # (B, V)
+
+        if top_k is not None and top_k < logits.size(-1):
+            keep_logits, keep_ids = logits.topk(top_k, dim=-1)  # (B, K)，(B, K)
+            logits = torch.full_like(logits, float("-inf")).scatter_(  # (B, V)
+                dim=-1, index=keep_ids, src=keep_logits
+            )
+
+        if top_p < 1.0:
+            sorted_logits, sorted_ids = logits.sort(dim=-1, descending=True)  # (B, V)，(B, V)
+            cumulative = sorted_logits.softmax(dim=-1).cumsum(dim=-1)  # (B, V)
+            # 前面的候选已达到阈值时才屏蔽当前位置，保留让总和达标的那个 token。
+            remove = torch.cat(
+                (torch.zeros_like(cumulative[:, :1], dtype=torch.bool), cumulative[:, :-1] >= top_p),
+                dim=-1,
+            )  # (B, V)
+            sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))  # (B, V)
+            logits = torch.empty_like(logits).scatter_(  # (B, V)，恢复词表原顺序。
+                dim=-1, index=sorted_ids, src=sorted_logits
+            )
+
+        probs = logits.softmax(dim=-1)  # (B, V)，被屏蔽的位置概率为 0。
+        return torch.multinomial(probs, num_samples=1)  # (B, 1)
