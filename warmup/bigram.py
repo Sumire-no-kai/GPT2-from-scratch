@@ -87,7 +87,7 @@ class CharTokenizer:
 
 
 def get_batch(
-    data: torch.Tensor, block_size: int, batch_size: int
+    data: torch.Tensor, block_size: int, batch_size: int, *, generator: torch.Generator | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """从 data 中随机切出一批训练样本：题目 x 和答案 y。
 
@@ -98,6 +98,7 @@ def get_batch(
         data: 整份语料编码后的一维编号序列，形状 (N,)，dtype 为 torch.long。
         block_size: 每段的长度 T。
         batch_size: 一批的段数 B。
+        generator: 可选的 CPU 随机数生成器，阶段 5 用它单独保存抽样进度。
 
     Returns:
         (x, y)，形状都是 (B, T)，dtype 与 data 相同。
@@ -117,7 +118,7 @@ def get_batch(
     # 所以合法起点是 0 到 N - T - 1；randint 的 high 取不到，正好填 N - T。
     # size 是结果的形状，必须是元组；(batch_size,) 末尾的逗号表示单元素元组。
     # 结果是形状 (B,) 的张量，例如 tensor([0, 3, 4])。
-    ix = torch.randint(low=0, high=length - block_size, size=(batch_size,))
+    ix = torch.randint(low=0, high=length - block_size, size=(batch_size,), generator=generator)
 
     # 对每个起点 i 切出一段长 T 的片段（得到 B 个形状 (T,) 的张量），
     # torch.stack 把它们上下叠成 (B, T)。

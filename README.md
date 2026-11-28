@@ -6,7 +6,7 @@
 
 ## 环境准备
 
-两端统一使用 Python 3.13；直接依赖固定为 PyTorch 2.14.1 和 NumPy 2.5.3。Mac 使用 MPS，Windows NVIDIA 显卡使用 CUDA，训练代码需要将模型和数据放到对应设备上。后续实现按 `cuda` → `mps` → `cpu` 选择设备。
+两端统一使用 Python 3.13，依赖版本见 [requirements.txt](requirements.txt)。Mac 使用 MPS，Windows NVIDIA 显卡使用 CUDA，训练代码需要将模型和数据放到对应设备上。后续实现按 `cuda` → `mps` → `cpu` 选择设备。
 
 每台机器分别创建自己的 `.venv`，不要跨系统复制虚拟环境。PyCharm 已创建 `.venv` 时，跳过创建步骤，并把项目解释器设为其中的 Python。
 
@@ -44,6 +44,7 @@ Mac 用于学习、调试和小实验，Windows 作为主要训练机器。先�
 
 - [前置知识大纲](docs/prerequisites.md)：各阶段需要掌握的知识与自查标准。
 - [学习笔记](notes/)：学习过程中写的技术笔记。
+- [加载预训练权重](notes/qa/03-weights.md#2-用官方权重对照输出)：下载 GPT-2 124M 权重并复现 CPU logits 对照。
 - [开发日志](docs/dev-log.md)：项目中各项决策的记录。
 
 ## 参考资料
