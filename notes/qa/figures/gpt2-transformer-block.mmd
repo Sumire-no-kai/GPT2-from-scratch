@@ -1,0 +1,11 @@
+flowchart TD
+    x["输入 x · (B, T, C)"] --> ln1["ln_1 · LayerNorm"]
+    ln1 --> attn["多头因果自注意力（汇总自己和左侧信息）"]
+    attn --> add1(("+"))
+    x -->|"残差旁路"| add1
+    add1 --> x1["注意力更新后的 x₁ · (B, T, C)"]
+    x1 --> ln2["ln_2 · LayerNorm"]
+    ln2 --> mlp["逐位置 MLP（C → 4C → C）"]
+    mlp --> add2(("+"))
+    x1 -->|"残差旁路"| add2
+    add2 --> out["输出 · (B, T, C)"]

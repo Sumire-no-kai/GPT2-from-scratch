@@ -60,6 +60,41 @@ class CausalSelfAttentionTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(tensor.grad).all())
             self.assertGreater(tensor.grad.abs().sum().item(), 0)
 
+    def test_sdpa_matches_reference_outputs_and_gradients(self):
+        reference = CausalSelfAttention(embedding_dim=12, num_heads=3).double()
+        sdpa = CausalSelfAttention(embedding_dim=12, num_heads=3, use_sdpa=True).double()
+        sdpa.load_state_dict(reference.state_dict(), strict=True)
+        generator = torch.Generator().manual_seed(13)
+
+        for length in (1, 7):
+            with self.subTest(length=length):
+                reference.zero_grad(set_to_none=True)
+                sdpa.zero_grad(set_to_none=True)
+                x = torch.randn(2, length, 12, generator=generator, dtype=torch.float64).requires_grad_()
+                y = x.detach().clone().requires_grad_()
+                expected, actual = reference(x), sdpa(y)
+                torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
+
+                gradient = torch.randn(expected.shape, generator=generator, dtype=expected.dtype)
+                expected.backward(gradient)
+                actual.backward(gradient)
+                torch.testing.assert_close(y.grad, x.grad, rtol=1e-10, atol=1e-12)
+                for left, right in zip(reference.parameters(), sdpa.parameters(), strict=True):
+                    self.assertIsNotNone(right.grad)
+                    torch.testing.assert_close(right.grad, left.grad, rtol=1e-10, atol=1e-12)
+
+    def test_sdpa_preserves_causality_in_training_mode(self):
+        attention = CausalSelfAttention(embedding_dim=8, num_heads=2, use_sdpa=True)
+        inputs = torch.randn(2, 5, 8, requires_grad=True)
+        prefix = attention(inputs)[:, :3]
+        changed = inputs.detach().clone()
+        changed[:, 3:] += 10.0
+        torch.testing.assert_close(attention(changed)[:, :3], prefix)
+        torch.testing.assert_close(attention(inputs[:, :3]), prefix)
+
+        prefix.sum().backward()
+        torch.testing.assert_close(inputs.grad[:, 3:], torch.zeros_like(inputs.grad[:, 3:]), atol=0, rtol=0)
+
     def test_rejects_invalid_head_sizes_and_input_shape(self):
         for embedding_dim, num_heads in ((8, 0), (7, 2), (0, 2)):
             with self.subTest(embedding_dim=embedding_dim, num_heads=num_heads):

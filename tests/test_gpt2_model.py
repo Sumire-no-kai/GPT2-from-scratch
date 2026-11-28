@@ -58,6 +58,23 @@ class GPT2Tests(unittest.TestCase):
         torch.testing.assert_close(original[:, :2], changed[:, :2])
         torch.testing.assert_close(original[:, :2], prefix_only)
 
+    def test_sdpa_reaches_all_blocks_and_loads_reference_weights(self):
+        sdpa = GPT2(11, 6, 8, 2, num_layers=2, use_sdpa=True)
+        sdpa.load_state_dict(self.model.state_dict(), strict=True)
+        ids = torch.tensor([[1, 3, 2, 8], [4, 7, 2, 0]])
+        expected = self.model(ids)
+        with patch.object(nn.functional, "scaled_dot_product_attention",
+                          wraps=nn.functional.scaled_dot_product_attention) as attention:
+            actual = sdpa(ids)
+
+        self.assertEqual(attention.call_count, len(sdpa.blocks))
+        for call in attention.call_args_list:
+            self.assertTrue(call.kwargs["is_causal"])
+            self.assertEqual(call.kwargs["dropout_p"], 0.0)
+            self.assertEqual(call.args[0].shape, (2, 2, 4, 4))  # (B, H, T, D)
+        self.assertIs(sdpa.lm_head.weight, sdpa.embeddings.wte.weight)
+        torch.testing.assert_close(actual, expected)
+
     def test_scales_all_residual_output_weights_by_model_depth(self):
         with patch.object(nn.init, "normal_", wraps=nn.init.normal_) as initialize:
             model = GPT2(11, 6, 8, 2, num_layers=3)

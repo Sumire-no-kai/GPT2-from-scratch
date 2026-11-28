@@ -23,6 +23,7 @@ def load_gpt2_weights(model: GPT2, checkpoint_path: str | Path) -> None:
     }
     mask_names = set()
     for index, block in enumerate(model.blocks):
+        # block 内的子层沿用 GPT-2 的命名，两边的名字只差 blocks.i. 和 h.i. 前缀。
         for suffix in block.state_dict():
             source_names[f"blocks.{index}.{suffix}"] = f"h.{index}.{suffix}"
         # 公开文件存了这个旧版因果遮罩，本项目的注意力会按输入长度生成。

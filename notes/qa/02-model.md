@@ -29,19 +29,7 @@ status: draft
 
 每段文本先由 tokenizer 编成一串整数 ID。把多段等长的序列并成一批，就得到形状为 `(B, T)` 的输入张量。接下来数据一路往前走：输入嵌入先把每个编号查表换成一条 `C` 维浮点向量，得到 `(B, T, C)`；随后 `L` 个 Transformer block 逐层更新这些向量，让每个位置既融合上文又提炼自身特征；最后经过 `ln_f` 归一化，再由 `lm_head` 为词表里的 `V` 个候选逐一打分，输出 `(B, T, V)` 的 logits。
 
-```mermaid
-flowchart TD
-    text["文本 → Tokenizer"] --> ids["Token ID · (B, T)"]
-    ids --> wte["wte · 查 token 向量"]
-    ids -->|"取长度 T"| positions["序列位置 0 到 T - 1"] --> wpe["wpe · 查位置向量"]
-    wte --> add(("+"))
-    wpe --> add
-    add -->|"(B, T, C)"| stack["Transformer block × L（124M 为 12 层）"]
-    stack -->|"(B, T, C)"| ln["ln_f · 最终归一化"]
-    ln --> head["lm_head · 为词表打分"]
-    wte -. "共享权重 (V, C)" .-> head
-    head --> logits["Logits · (B, T, V)"]
-```
+![GPT-2 前向结构图。Token 和位置嵌入相加，经 Transformer blocks 与末尾归一化，由共享权重的输出层生成 logits。](figures/gpt2-forward.svg)
 
 图中实线表示前向计算的数据流向，虚线表示 `wte` 这张表同时借给 `lm_head` 做输出打分。[展开看单个 block 的内部结构](#4-transformer-block)
 
@@ -79,7 +67,7 @@ flowchart TD
 
 模型没法直接拿整数编号做加减乘除——编号 `18435` 并不比编号 `5` 「大三千多倍」，它只是词表里的门牌号。所以进入网络的第一步，是把每个整数 ID 换成一条可训练的浮点向量。
 
-但只有 token 向量还不够。后面的自注意力本质上是拿各位置的向量两两比较，它自己分不清谁排在第 0 位、谁排在第 1 位；如果不加位置信息，「猫吃鱼」和「鱼吃猫」在它眼里几乎没有顺序差别。因此 GPT-2 准备了两张可训练的查找表：
+但只有 token 向量还不够。固定一个查询，同时打乱它可见的 K、V 配对顺序，加权和保持不变。把整句话里的 token 换序时，各位置的查询和可见前缀也可能变化。GPT-2 选择用两张可训练的查找表，把 token 的身份和它的绝对位置明确加进输入：
 
 - **`wte`（token embedding）**：按 token ID 查行，告诉模型「这里是什么词」。
 - **`wpe`（position embedding）**：按位置 `0, 1, ..., T - 1` 查行，告诉模型「它出现在第几个位置」。
@@ -178,9 +166,11 @@ class GPT2Embeddings(nn.Module):
 
 ### 相关问答
 
-#### Q2.1 为什么同一个 token 出现两次，不是只查一次表就够了？
+#### Q2.1 Token embedding（`wte`）和位置 embedding（`wpe`）是什么？
 
-**A：** 因为同一个词在不同位置扮演的角色可能完全不同，比如「我打你」和「你打我」。如果只查 `wte`，同一个 token 在句子开头和结尾拿到的是完全一样的向量；把对应位置的 `wpe` 加上之后（就像上面手算表里第 0 段的两个 `1` 分别变成了 `[3, 1, 6]` 和 `[2, 4, 5]`），后面的层才能区分「哪一个在前、哪一个在后」。两张表里的数字都是可训练参数，会在预测下一个 token 的过程中一起学出来。
+**A：** 它们是两张可训练的查找表，每一行都是一条 `C` 维向量。`wte` 按 token ID 查行，告诉模型这里是什么 token；`wpe` 按序列位置查行，告诉模型它出现在第几个位置。
+
+同一个 token 出现两次时，两次查到的都是 `wte` 的同一行，但会分别加上 `wpe` 的不同行。比如上面[手算表](#手算两段序列的查表结果)里第 0 段的两个 `1`，相加后分别变成了 `[3, 1, 6]` 和 `[2, 4, 5]`，后面的层因此能区分它们的先后。两张表里的数字都是模型参数，训练时根据预测下一个 token 的误差一起更新。
 
 #### Q2.2 不同模型的 token embedding 和位置 embedding 一样吗？
 
@@ -228,10 +218,11 @@ class CausalSelfAttention(nn.Module):
     """按各头的注意力权重汇总当前位置和之前位置的信息。"""
 
     # 设置头数和每头的宽度，建立 Q/K/V 共用的投影层和输出投影层。
-    def __init__(self, embedding_dim: int, num_heads: int) -> None:
+    def __init__(self, embedding_dim: int, num_heads: int, *, use_sdpa: bool = False) -> None:
         """用向量维度 C 和头数 H 创建注意力，要求 C 可被 H 整除。
 
         每头处理 D = C // H 个数。两个线性层的权重形状为 (3C, C) 和 (C, C)。
+        use_sdpa 让 PyTorch 根据输入选择 SDPA 后端，默认走显式的参考实现。
         """
         super().__init__()
         if embedding_dim <= 0 or num_heads <= 0 or embedding_dim % num_heads != 0:
@@ -239,6 +230,7 @@ class CausalSelfAttention(nn.Module):
 
         self.num_heads = num_heads
         self.head_dim = embedding_dim // num_heads
+        self.use_sdpa = use_sdpa
         self.c_attn = nn.Linear(embedding_dim, 3 * embedding_dim)
         self.c_proj = nn.Linear(embedding_dim, embedding_dim)
 
@@ -251,7 +243,7 @@ class CausalSelfAttention(nn.Module):
 
 1. 构造函数接收向量维度 `C = embedding_dim` 和头数 `H = num_heads`，先调 `super().__init__()` 初始化模块。
 2. `if embedding_dim <= 0 or num_heads <= 0 or embedding_dim % num_heads != 0` 确保两者都是正整数且 `C` 能被 `H` 整除。因为 `or` 会短路，当 `num_heads == 0` 时第二个条件已经成立，不会继续执行 `% 0`。
-3. 记下 `self.num_heads` 和每头宽度 `self.head_dim = C // H`。比如 `C = 8`、`H = 2` 时，每个头处理 4 个数。
+3. 记下 `self.num_heads` 和每头宽度 `self.head_dim = C // H`。比如 `C = 8`、`H = 2` 时，每个头处理 4 个数。`self.use_sdpa` 是阶段 6 留出的加速开关（SDPA 即 PyTorch 内置的缩放点积注意力加速接口，底层可调用 FlashAttention），默认关闭，走本节手写的参考实现。
 4. `self.c_attn = nn.Linear(C, 3 * C)` 用一个大线性层一次性算出 Q、K、V，等价于三个独立的 `Linear(C, C)` 拼在一起，但一次矩阵乘法更省事。输出的 `3C` 个数里，前 `C` 个是 Q、中间 `C` 个是 K、最后 `C` 个是 V；权重形状 `(3C, C)`，偏置 `(3C,)`。
 5. `self.c_proj = nn.Linear(C, C)` 是输出投影层：等所有头的结果拼接回 `C` 维之后，用它把各个头读到的信息混合到一起。权重形状 `(C, C)`，偏置 `(C,)`。
 6. 最后四行按 GPT-2 原版代码初始化：两层权重都用均值 0、标准差 `0.02` 的正态分布，偏置全部清零。[GPT-2 官方实现](https://github.com/openai/gpt-2/blob/master/src/model.py)
@@ -281,17 +273,23 @@ class CausalSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
         query, key, value = qkv.unbind(dim=0)
 
-        # 每行是一处查询位置，每列是可供比较的一个键位置。
-        transposed_key = key.transpose(-2, -1)  # (B, H, D, T)
-        scores = (query @ transposed_key) / math.sqrt(self.head_dim)  # (B, H, T, T)
+        if self.use_sdpa:
+            # PyTorch 在内核里缩放并施加因果遮罩。关闭 dropout 以对齐参考实现。
+            context = F.scaled_dot_product_attention(
+                query, key, value, dropout_p=0.0, is_causal=True,
+            )  # (B, H, T, D)
+        else:
+            # 每行是一处查询位置，每列是可供比较的一个键位置。
+            transposed_key = key.transpose(-2, -1)  # (B, H, D, T)
+            scores = (query @ transposed_key) / math.sqrt(self.head_dim)  # (B, H, T, T)
 
-        positions = torch.arange(sequence_length, device=x.device)  # (T,)
-        future_mask = positions.unsqueeze(0) > positions.unsqueeze(1)  # (T, T)
-        # 遮罩对所有序列和注意力头生效，未来位置经过 softmax 后的权重为零。
-        scores = scores.masked_fill(future_mask, float("-inf"))  # (B, H, T, T)
-        weights = torch.softmax(scores, dim=-1)  # (B, H, T, T)
+            positions = torch.arange(sequence_length, device=x.device)  # (T,)
+            future_mask = positions.unsqueeze(0) > positions.unsqueeze(1)  # (T, T)
+            # 遮罩对所有序列和注意力头生效，未来位置经过 softmax 后的权重为零。
+            scores = scores.masked_fill(future_mask, float("-inf"))  # (B, H, T, T)
+            weights = torch.softmax(scores, dim=-1)  # (B, H, T, T)
+            context = weights @ value  # (B, H, T, D)
 
-        context = weights @ value  # (B, H, T, D)
         context = context.transpose(1, 2)  # (B, T, H, D)
         context = context.reshape(batch_size, sequence_length, embedding_dim)  # (B, T, C)
         return self.c_proj(context)  # (B, T, C)
@@ -306,6 +304,8 @@ class CausalSelfAttention(nn.Module):
 5. `unbind(dim=0)` 沿最前面长度为 3 的那一维拆开，得到 `query`、`key`、`value` 三个张量，各自都是 `(B, H, T, D)`。
 
 #### 第二步：算匹配分数、遮住未来、归一化成权重
+
+开启 `use_sdpa` 时，`F.scaled_dot_product_attention` 用三个 `(B, H, T, D)` 张量完成缩放、因果遮罩、归一化和汇总，直接返回 `context`。两条路径都从 `context` 开始拼回各头。下面按手写分支展开计算。
 
 1. `key.transpose(-2, -1)` 交换 `key` 的最后两维，从 `(B, H, T, D)` 变成 `(B, H, D, T)`，相当于把每个位置的 K 竖着排成一列。
 2. `query @ transposed_key` 对每段序列、每个头做 `(T, D) @ (D, T)`，得到 `(B, H, T, T)`。其中第 `i` 行第 `j` 列就是位置 `i` 的 Q 和位置 `j` 的 K 的点积（例如 `[0, 2]` 和 `[1, 0.5]` 的点积是 `0 × 1 + 2 × 0.5 = 1`）。接着除以 `math.sqrt(self.head_dim)`：头越宽，点积的数值波动越大，除以 `sqrt(D)` 能把分数拉回合适范围，防止 softmax 过早变成接近 0 和 1 的极端分布、导致梯度变小。
@@ -364,14 +364,14 @@ class CausalSelfAttention(nn.Module):
 
 ### 测试检查了什么
 
-[自注意力测试](../../tests/test_gpt2_attention.py) 包含 5 项测试，分别检查：
+[自注意力测试](../../tests/test_gpt2_attention.py) 覆盖手写与 SDPA 两条路径：
 
 - **形状**：权重 `(3C, C)`、`(C, C)` 以及输出 `(B, T, C)` 是否符合预期。
 - **因果性**：只改第 2 个位置之后的输入，前两个位置的输出必须纹丝不动。
 - **加权结果**：用上面那组手算好的小矩阵，逐元素核对两个头的缩放点积与加权和。
 - **梯度与非法输入**：反向传播能传回输入和两个投影层；`embedding_dim`、`num_heads` 或输入形状非法时会明确报 `ValueError`。
 
-此外还用逐位置手写循环的参考实现及 PyTorch 内置的 `scaled_dot_product_attention` 对照了输出和梯度，并在 CPU 与 MPS 上验证通过。
+阶段 6 新增两个测试，使用同一份投影参数核对两条路径的前向和梯度，并检查 SDPA 在训练模式下对未来位置的因果隔离。阶段 2 的手写实现也已用逐位置参考实现核对过，并在 CPU 与 MPS 上验证。
 
 ### 把输入嵌入和注意力串起来跑一遍
 
@@ -406,11 +406,11 @@ assert x.shape == output.shape == (1, 2, 8)
 
 之所以要缩放，是因为残差加法会把每条分支的结果一路累加到主干上；层数越深，累加次数越多，初始激活的方差也会跟着变大。GPT-2 论文提出按残差分支总数 `N`，用 `1 / sqrt(N)` 缩放每条分支的输出投影权重。[GPT-2 论文 §2.3](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf#page=4) · [GPT-2 公开模型代码](https://github.com/openai/gpt-2/blob/master/src/model.py)
 
-完整模型有 `L` 个 block，每个 block 里注意力和 MLP 各贡献一条残差分支，所以总分支数 `N = 2L`。因此 `GPT2.__init__` 会把所有 `attn.c_proj.weight` 和 `mlp.c_proj.weight` 的初始化标准差统一设成 `0.02 / sqrt(2 * L)`（`L = 12` 时约为 `0.00408`）。这项初始化只影响从头训练；阶段 3 加载官方预训练权重时会直接覆盖它们。[nanoGPT 初始化代码](https://github.com/karpathy/nanoGPT/blob/master/model.py#L128-L134)
+完整模型有 `L` 个 block，每个 block 里注意力和 MLP 各贡献一条残差分支，所以总分支数 `N = 2L`。因此 `GPT2.__init__` 会把所有 `attn.c_proj.weight` 和 `mlp.c_proj.weight` 的初始化标准差统一设成 `0.02 / sqrt(2 * L)`（`L = 12` 时约为 `0.00408`）。这项初始化只影响从头训练；阶段 3 加载官方预训练权重时会直接覆盖它们。[nanoGPT 初始化代码](https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L142-L145)
 
 #### Q3.2 这一节现在需要加入 dropout 吗？
 
-**A：** 暂时不加。Dropout 会在训练时随机把一部分数值置零来减轻过拟合，评估和推理时则靠 `eval()` 关闭。阶段 2 需要确定性的输出，方便核对手算结果和因果性，阶段 3 加载官方权重做对齐也不需要 dropout。到了阶段 5，我们会先从 `dropout=0` 的基线开始训练；如果看到训练 loss 一直降、验证 loss 反而回升，再加入默认值为 `0` 的可选 dropout 做对照。nanoGPT 默认也是 `0`，只在小数据集的字符级 Shakespeare 示例里开了 `0.2`。[nanoGPT 默认配置](https://github.com/karpathy/nanoGPT/blob/master/model.py#L99-L107) · [字符级训练配置](https://github.com/karpathy/nanoGPT/blob/master/config/train_shakespeare_char.py#L14-L22)
+**A：** 暂时不加。Dropout 会在训练时随机把一部分数值置零来减轻过拟合，评估和推理时则靠 `eval()` 关闭。阶段 2 需要确定性的输出，方便核对手算结果和因果性，阶段 3 加载官方权重做对齐也不需要 dropout。到了阶段 5，我们会先从 `dropout=0` 的基线开始训练；如果看到训练 loss 一直降、验证 loss 反而回升，再加入默认值为 `0` 的可选 dropout 做对照。nanoGPT 默认也是 `0`，只在小数据集的字符级 Shakespeare 示例里开了 `0.2`。[nanoGPT 默认配置](https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/model.py#L108-L116) · [字符级训练配置](https://github.com/karpathy/nanoGPT/blob/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/config/train_shakespeare_char.py#L21-L25)
 
 ## 4 Transformer block
 
@@ -418,19 +418,7 @@ assert x.shape == output.shape == (1, 2, 8)
 
 一个 Transformer block 负责把序列的向量表示往前推进一轮：先用[因果自注意力](#3-因果自注意力)在**不同位置之间**搬运和汇总信息，再用 MLP 在**每个位置内部**把汇总来的特征进一步加工。因为输入和输出都是 `(B, T, C)`，多个 block 可以像积木一样直接串起来。
 
-```mermaid
-flowchart TD
-    x["输入 x · (B, T, C)"] --> ln1["ln_1 · LayerNorm"]
-    ln1 --> attn["多头因果自注意力（汇总自己和左侧信息）"]
-    attn --> add1(("+"))
-    x -->|"残差旁路"| add1
-    add1 --> x1["注意力更新后的 x₁ · (B, T, C)"]
-    x1 --> ln2["ln_2 · LayerNorm"]
-    ln2 --> mlp["逐位置 MLP（C → 4C → C）"]
-    mlp --> add2(("+"))
-    x1 -->|"残差旁路"| add2
-    add2 --> out["输出 · (B, T, C)"]
-```
+![Transformer block 结构图。注意力和 MLP 各自在分支入口做 LayerNorm，分支输出与各自的输入做残差相加。](figures/gpt2-transformer-block.svg)
 
 在把注意力和 MLP 接起来时，GPT-2 用了两个关键设计：**LayerNorm** 和 **残差加法**。
 
@@ -498,11 +486,11 @@ class TransformerBlock(nn.Module):
     """按 GPT-2 的 Pre-LayerNorm 顺序执行注意力和 MLP 两次残差更新。"""
 
     # 给注意力和 MLP 各配一份独立的 LayerNorm，复用已实现的因果自注意力。
-    def __init__(self, embedding_dim: int, num_heads: int) -> None:
-        """用向量维度 C 和头数 H 创建一个 block，每个子模块都接收 C 维向量。"""
+    def __init__(self, embedding_dim: int, num_heads: int, *, use_sdpa: bool = False) -> None:
+        """创建一个接收 C 维向量的 block，并把 use_sdpa 传给注意力层。"""
         super().__init__()
         self.ln_1 = nn.LayerNorm(embedding_dim, eps=1e-5)
-        self.attn = CausalSelfAttention(embedding_dim, num_heads)
+        self.attn = CausalSelfAttention(embedding_dim, num_heads, use_sdpa=use_sdpa)
         self.ln_2 = nn.LayerNorm(embedding_dim, eps=1e-5)
         self.mlp = MLP(embedding_dim)
 
@@ -522,8 +510,8 @@ class TransformerBlock(nn.Module):
 #### Block 的初始化逐行看
 
 1. `super().__init__()` 注册子模块机制，下面挂上的四个子模块都会被自动纳入参数管理。
-2. `self.ln_1 = nn.LayerNorm(embedding_dim, eps=1e-5)` 建第一份归一化层。`eps=1e-5` 是加在方差上的极小正数，开平方后用来避免向量里所有数字都相等时方差为 0、出现除以 0。它有长度各为 `C` 的缩放和偏移参数。
-3. `self.attn = CausalSelfAttention(embedding_dim, num_heads)` 装入前面写好的多头因果自注意力。
+2. `self.ln_1 = nn.LayerNorm(embedding_dim, eps=1e-5)` 建第一份归一化层。`eps=1e-5` 是先加到方差上、再一起开平方的极小正数：向量里所有数字都相等时方差为 0，有了它就不会除以 0。它有长度各为 `C` 的缩放和偏移参数。
+3. `self.attn = CausalSelfAttention(..., use_sdpa=use_sdpa)` 装入前面写好的多头因果自注意力，并传下计算路径的开关。
 4. `self.ln_2 = nn.LayerNorm(embedding_dim, eps=1e-5)` 为 MLP 单独建第二份归一化层（与 `ln_1` 参数独立），处理已经更新过一轮的 `x`。
 5. `self.mlp = MLP(embedding_dim)` 装入刚实现的逐位置 MLP。
 
@@ -585,15 +573,18 @@ class GPT2(nn.Module):
         embedding_dim: int = 768,
         num_heads: int = 12,
         num_layers: int = 12,
+        *,
+        use_sdpa: bool = False,
     ) -> None:
-        """默认构建 GPT-2 124M，可传入较小的尺寸进行练习和测试。"""
+        """默认构建 GPT-2 124M，设 use_sdpa=True 让所有 block 使用 SDPA。"""
         super().__init__()
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
 
         self.embeddings = GPT2Embeddings(vocab_size, max_seq_len, embedding_dim)
         self.blocks = nn.ModuleList(
-            TransformerBlock(embedding_dim, num_heads) for _ in range(num_layers)
+            TransformerBlock(embedding_dim, num_heads, use_sdpa=use_sdpa)
+            for _ in range(num_layers)
         )
         self.ln_f = nn.LayerNorm(embedding_dim, eps=1e-5)
         self.lm_head = nn.Linear(embedding_dim, vocab_size, bias=False)
@@ -610,7 +601,7 @@ class GPT2(nn.Module):
 
 1. 构造函数默认填好 124M 的配置；先检查 `num_layers > 0`，确保至少有一个 block，且后面算 `1 / sqrt(2 * num_layers)` 不会出问题。
 2. `self.embeddings = GPT2Embeddings(...)` 复用第 2 节的两张查找表。
-3. `self.blocks = nn.ModuleList(...)` 用生成器循环创建 `L` 个**参数各自独立**的 block（它们结构相同，但每一层学到的权重不同）。这里必须包在 `nn.ModuleList` 里而不是普通 Python `list`，PyTorch 才能把所有层的参数都登记进模型。
+3. `self.blocks = nn.ModuleList(...)` 用生成器循环创建 `L` 个**参数各自独立**的 block（它们结构相同，但每一层学到的权重不同），每个 block 都接收 `use_sdpa`。这里必须包在 `nn.ModuleList` 里而不是普通 Python `list`，PyTorch 才能把所有层的参数都登记进模型。
 4. `self.ln_f = nn.LayerNorm(embedding_dim, eps=1e-5)` 是整叠 block 之后的最后一道归一化。因为 GPT-2 用的是 Pre-LayerNorm，每层的 `ln_1` 和 `ln_2` 都只在分支入口生效，残差主干本身一路累加下来从来没有归一化过，所以在送去打分之前需要用 `ln_f` 统一归一一次。
 5. `self.lm_head = nn.Linear(embedding_dim, vocab_size, bias=False)` 把每个位置的 `C` 维向量投影成词表里 `V` 个候选的分数，权重形状正好也是 `(V, C)`。
 6. `self.lm_head.weight = self.embeddings.wte.weight` 实现了**权重共享**：输入时遇到 token ID `i` 就查这张表的第 `i` 行；输出时则拿最终向量跟第 `i` 行做点积，看它和 token `i` 有多匹配。因为两处指向同一个 `Parameter`，反向传播时两边的梯度会一起累加到这张表上，统计参数量时也只算一次。[GPT-2 官方输出投影](https://github.com/openai/gpt-2/blob/master/src/model.py)
@@ -651,11 +642,12 @@ class GPT2(nn.Module):
 | 输出投影 `lm_head`（与 `wte` 共享） | 0 |
 | 合计 | **124,439,808** |
 
-[完整模型测试](../../tests/test_gpt2_model.py) 包含 6 项测试：
+[完整模型测试](../../tests/test_gpt2_model.py) 包含 7 项测试：
 
 - **124M 参数量**：在 PyTorch 的 `meta` 设备（一种只登记张量形状、不真正分配内存的虚拟设备）上实例化默认 `GPT2()`，精确数出 `124,439,808` 个参数。
 - **前向与权重共享**：检查经过全部 block、`ln_f` 和无偏置 `lm_head` 后的数值，确认 `lm_head.weight` 和 `embeddings.wte.weight` 是同一个参数对象且能正常反传梯度。
 - **整网因果性**：改掉序列后半段的 token ID，或者干脆把输入截断成前半段，前几个位置的 logits 都保持一致。
+- **SDPA 加速路径对照**：把手写版本的权重加载到开启 `use_sdpa=True` 的整网模型里，验证两边输出的 logits 在测试容差内一致、权重共享不变，且每个 block 确实调用了 PyTorch 内置的因果 SDPA。
 - **深度缩放与参数校验**：确认所有 `c_proj.weight` 按 `0.02 / sqrt(2 * L)` 初始化而 `c_attn`、`c_fc` 保持 `0.02`；传入 `num_layers=0` 时抛出 `ValueError`。
 
 下面把阶段 1 的官方词表和完整 `GPT2` 接起来跑一次（用 2 层小模型演示，避免在演示里分配 124M 权重）：
@@ -684,7 +676,39 @@ assert logits.shape == (1, 2, 50_257)
 
 输出 `(1, 2, 50_257)` 表示 1 段序列、2 个位置，每个位置都有 50,257 个候选分数。现在权重还是随机的，重点在于验通结构和形状；到阶段 3 加载官方权重后，这些分数就能和参考实现逐位对齐。
 
-## 6 Bigram、GPT-2 与原版 Transformer
+## 6 GPT-2 为什么是这样的结构
+
+前面几节按代码顺序讲了每个部件怎么算。这一节换个角度看：每个部件为什么这样设计，整个 GPT-2 又和其他模型有什么不同。
+
+### 每个部件为什么这样设计
+
+| 部件 | 做什么 | 为什么这样设计 | 代价或限制 |
+|---|---|---|---|
+| byte-level BPE（[阶段 1](01-tokenizer.md#6-gpt-2-的字节映射)） | 把文本切成子词编号。 | 词表从 256 个字节起步，任何文本都能编码，不会遇到未知字符；常见的词合成一个 token，序列更短。 | 合并规则几乎都是从英文里学来的，中文会被切得很碎。 |
+| `wte`（[第 2 节](#2-输入嵌入)） | 把编号换成 `C` 维向量。 | 编号只是门牌号，换成可训练的向量后，意思相近的 token 可以学到相近的向量。 | 这张表有 `V × C` 个参数，占 124M 的 31%。 |
+| `wpe`（[第 2 节](#2-输入嵌入)） | 给每个位置加一条向量。 | GPT-2 用这张表显式提供绝对位置。因果模型也可以从因果遮罩中学到隐式位置信息。原版 Transformer 的位置表与正弦公式在其实验中效果接近，GPT-1 采用了可学习的位置表。[位置编码研究](https://aclanthology.org/2022.findings-emnlp.99/) | 表只有 `P = 1024` 行，读不了更长的上下文，阶段 4 的生成因此要用滑动窗口。 |
+| 因果自注意力（[第 3 节](#3-因果自注意力)） | 在位置之间交换信息。 | 每个位置能直接读取窗口里任意一个前文位置。因果遮罩让一段 `T` 个 token 的文本只做一次前向就得到 `T` 道「预测下一个 token」的题，训练时看到的条件也和生成时一致。 | 点积计算量随 `T²` 增长。手写分支保存 `T × T` 矩阵，FlashAttention 可以减少这部分显存开销。 |
+| 多头（[第 3 节](#目标与接口)） | 把 `C` 维拆成 `H` 个子空间，各算一套权重。 | 不同的头可以同时关注不同的关系。 | 头数不改变参数量，只改变怎么拆分。 |
+| MLP（[第 4 节](#mlp-逐位置处理特征)） | 在每个位置内部加工特征，`C → 4C → C`。 | 4 倍宽沿用原版 Transformer。GELU 比 ReLU 平滑，GPT-1 起就用它；必须用 tanh 近似才能和官方权重对齐。 | 每个 block 约 2/3 的参数在这里（472 万 / 709 万）。 |
+| 残差加法（[第 4 节](#一个-block-做什么)） | 分支只算增量，加回主干。 | 信息和梯度都能沿着加法路径直通，网络叠深也能训练。 | 主干的数值会随层数累积变大。 |
+| Pre-LayerNorm 与 `ln_f`（[第 4 节](#一个-block-做什么)、[第 5 节](#初始化如何装好完整模型)） | 每条分支入口先归一化，全部 block 之后再归一化一次。 | 主干保持纯粹的加法，梯度不必每层都穿过归一化，层数加深时训练更稳。主干本身从没被归一化过，所以打分前要用 `ln_f` 统一处理。 | 没有明显代价。 |
+| 缩放初始化（[Q3.1](#q31-残差分支的输出投影现在需要缩放初始化吗)） | 两个 `c_proj` 的初始标准差设为 `0.02 / sqrt(2L)`。 | 主干要累加 `2L` 次，每次加得少一点，初始时的方差才不会失控。 | 只影响从头训练，加载官方权重时会被覆盖。 |
+| `lm_head` 共享 `wte`（[第 5 节](#初始化如何装好完整模型)） | 用同一张表给每个候选打分。 | 输入时「编号换向量」和输出时「向量比回编号」是同一种对应关系；还省下 3,860 万个参数。 | 输入和输出不能各学各的表示，后来不少大模型改回了不共享（见 [Q8.3](#q83-现代大模型在-gpt-2-的基础上改了哪些部件)）。 |
+
+### 为什么只要一条 decoder
+
+GPT-2 论文的出发点是：语言模型只要把「预测下一个 token」学好，很多任务都能写成续写文本来完成。比如在提示词里写「翻译成中文：I like cats。译文：」，或者在一篇文章后面接上 `TL;DR:` 让它写摘要。输入和输出放进同一条序列就够了，不再需要专门读原文的 Encoder。训练数据也不用人工标注：OpenAI 从网上收集了约 800 万个网页（WebText，约 40 GB 文本），每个位置的下一个 token 就是现成的答案。[GPT-2 论文 §2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf#page=2)
+
+另一个好处是容易放大。整个模型就是同一种 block 的堆叠，换尺寸只要改三个数：
+
+| 型号 | 层数 `L` | 宽度 `C` | 头数 `H` |
+|---|---:|---:|---:|
+| 124M | 12 | 768 | 12 |
+| 355M | 24 | 1024 | 16 |
+| 774M | 36 | 1280 | 20 |
+| 1.5B | 48 | 1600 | 25 |
+
+论文 Table 2 把前两个型号写成 117M 和 345M。OpenAI 后来在代码仓库里说明当初的参数量算错了，改称 124M 和 355M，和我们数出的 124,439,808 一致。[GPT-2 论文 Table 2](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf#page=4) · [GPT-2 官方仓库说明](https://github.com/openai/gpt-2#gpt-2)
 
 ### GPT-2 比阶段 0 的 Bigram 多了什么
 
@@ -699,23 +723,51 @@ GPT-2 的 `wte` 查出来的只是 `C` 维特征向量，加上位置信息后�
 | 网络结构 | 一张 `(V, V)` 的表。 | `wte`/`wpe` + 多层 Transformer block + `ln_f` + 共享权重的 `lm_head`。 |
 | 输出和目标 | `(B, T, V)`，预测下一个 token。 | 同样是 `(B, T, V)`，预测下一个 token。 |
 
+### GPT-2 和前身 GPT-1 比改了什么
+
+GPT-1（2018 年）已经是 decoder-only 结构，尺寸和 124M 相同：12 层、768 维、12 个头，MLP 中间 3072 维，也用可学习的位置表和 GELU。GPT-2 论文说最小的型号「等同于原来的 GPT」，结构上只改了下面几处，其余大体沿用 GPT-1。[GPT-1 论文 §4.1](https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf) · [GPT-2 论文 §2.3](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf#page=4)
+
+| 对比 | GPT-1 | GPT-2 |
+|---|---|---|
+| LayerNorm 的位置 | Post-LayerNorm，和原版 Transformer 一样。 | Pre-LayerNorm，全部 block 之后再加 `ln_f`。 |
+| 残差投影的初始化 | 统一用标准差 `0.02`。 | 按残差分支数缩放。 |
+| 上下文长度 | 512 | 1024 |
+| 词表 | 以字符为单位学 40,000 条 BPE 合并。 | 50,257，以字节为单位的 BPE。 |
+| 训练 batch | 64 段序列 | 512 段序列 |
+| 训练数据 | BooksCorpus，7000 多本书。 | WebText，约 40 GB 网页文本。 |
+| 最大规模 | 约 1.2 亿参数 | 15 亿参数 |
+
+所以结构上最关键的改动是 Pre-LayerNorm，它让模型能稳定地叠到 48 层。GPT-2 的能力提升主要来自更大的模型和更多、更杂的数据。
+
 ### GPT-2 与 2017 年原版 Transformer 有什么区别
 
 2017 年《Attention Is All You Need》提出的是面向机器翻译的**编码器–解码器（Encoder–Decoder）**架构：比如把英文 `I like cats` 翻成中文时，Encoder 先把整句英文编成一组向量，Decoder 再一边逐字写中文，一边通过**交叉注意力**（Q 来自 Decoder，K 和 V 来自 Encoder）去查英文原文。[原版 Transformer 论文 §3.1–3.2](https://arxiv.org/pdf/1706.03762#page=3)
 
-GPT-2 去掉了 Encoder 和交叉注意力，只留下带因果遮罩的解码部分，叫做 **decoder-only Transformer**。它把提示词和生成内容放进同一条序列里——比如输入 `翻译成中文：I like cats。译文：`，后面逐个 token 接续写下去。每层 block 都只在同一条序列里做因果自注意力，每个位置只看自己和左侧。[GPT-2 官方 block 和模型](https://github.com/openai/gpt-2/blob/master/src/model.py) · [原版 Transformer Decoder](https://arxiv.org/pdf/1706.03762#page=3)
+GPT-2 去掉了 Encoder 和交叉注意力，只留下带因果遮罩的解码部分，叫做 **decoder-only Transformer**。它把提示词和生成内容放进同一条序列里，每层 block 都只在这条序列里做因果自注意力，每个位置只看自己和左侧。[GPT-2 官方 block 和模型](https://github.com/openai/gpt-2/blob/master/src/model.py) · [原版 Transformer Decoder](https://arxiv.org/pdf/1706.03762#page=3)
 
 | 对比 | 2017 年原版 Transformer | GPT-2 |
 |---|---|---|
+| 训练目标 | 给定原文生成译文，需要成对的翻译数据。 | 预测下一个 token，用没有标注的网页文本。 |
 | 数据流 | 两条序列：Encoder 读源文，Decoder 读目标前缀并参考 Encoder。 | 一条序列：提示作前缀，每步续写下一个 token。 |
 | 注意力类型 | Encoder 自注意力、Decoder 因果自注意力、交叉注意力。 | 全部 block 都只用因果自注意力。 |
 | LayerNorm 与残差的顺序 | Post-LayerNorm：`LN(x + branch(x))`。 | Pre-LayerNorm：`x + branch(LN(x))`，全部 block 后再加 `ln_f`。 |
-| 位置表示 | 固定的正弦/余弦公式。 | 可学习的绝对位置表 `wpe`。 |
+| 位置表示 | 固定的正弦/余弦公式。作者也试过可学习的位置表，效果几乎一样。 | 可学习的绝对位置表 `wpe`。 |
 | 前馈网络激活函数 | ReLU。 | GELU 的 tanh 近似。 |
+| 基础尺寸 | base 版 Encoder、Decoder 各 6 层，512 维，8 个头。 | 124M 为 12 层，768 维，12 个头。 |
 
-这些结构差异分别见原版论文 §3.1、§3.3、§3.5 以及 GPT-2 论文 §2.3 与公开源码。[原版 Transformer 论文](https://arxiv.org/pdf/1706.03762) · [GPT-2 论文 §2.3](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf#page=4) · [GPT-2 官方实现](https://github.com/openai/gpt-2/blob/master/src/model.py)
+这些结构差异分别见原版论文 §3.1、§3.3、§3.5 与 Table 3，以及 GPT-2 论文 §2.3 与公开源码。[原版 Transformer 论文](https://arxiv.org/pdf/1706.03762) · [GPT-2 论文 §2.3](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf#page=4) · [GPT-2 官方实现](https://github.com/openai/gpt-2/blob/master/src/model.py)
 
-至于输出层权重共享，两者都采用了同样思路：原版翻译模型把输入/输出 embedding 与输出投影共享，GPT-2 则在单序列里让 `wte` 和 `lm_head` 共用一张表。[原版 Transformer 论文 §3.4](https://arxiv.org/pdf/1706.03762#page=5) · [GPT-2 官方输出投影](https://github.com/openai/gpt-2/blob/master/src/model.py)
+至于输出层权重共享，两者思路相同：原版翻译模型让两张 embedding 表和输出投影共用一个矩阵，GPT-2 则在单序列里让 `wte` 和 `lm_head` 共用一张表。[原版 Transformer 论文 §3.4](https://arxiv.org/pdf/1706.03762#page=5) · [GPT-2 官方输出投影](https://github.com/openai/gpt-2/blob/master/src/model.py)
+
+### 和 BERT、RNN、CNN 比
+
+| 模型 | 每个位置能看到什么 | 擅长什么 | 和 GPT-2 的主要区别 |
+|---|---|---|---|
+| BERT（encoder-only） | 左右两边的全部内容。 | 理解已有的文本，比如分类、找答案所在的位置。 | 训练时遮住一些词让它填空，没有因果遮罩，所以不能自然地一个字一个字往下写。 |
+| RNN / LSTM | 前文被压缩进一个固定大小的状态。 | 逐步处理序列。 | 必须一步一步读，训练难以并行；离得远的内容容易被「忘掉」。注意力能直接查任意一个早先的位置。 |
+| CNN | 每层只看一个局部窗口。 | 提取局部模式。 | 要叠很多层才能看到远处；注意力一层就能看到整个窗口。 |
+
+[BERT 论文](https://arxiv.org/abs/1810.04805)
 
 ## 7 回顾
 
@@ -743,6 +795,33 @@ GPT-2 去掉了 Encoder 和交叉注意力，只留下带因果遮罩的解码�
 
 至于 ChatGPT 背后的具体闭源型号，只能以官方披露为准——比如 GPT-4 技术报告说明它是 Transformer 架构，但没有公开具体的训练框架和线上推理栈。[GPT-4 技术报告](https://cdn.openai.com/papers/gpt-4.pdf#page=2)
 
+### Q8.3 现代大模型在 GPT-2 的基础上改了哪些部件？
+
+**A：** 骨架基本没变：仍然是 decoder-only、Pre-Norm、残差堆叠的 block，训练目标仍然是预测下一个 token。变的是零件。以 LLaMA 为代表的现代模型大致做了这些替换：
+
+| GPT-2 | 现代做法 | 为什么换 |
+|---|---|---|
+| 可学习的位置表 `wpe` | RoPE（旋转位置编码） | 在每层注意力里按位置旋转 Q 和 K，点积只和两个位置的相对距离有关；不再有固定行数的位置表，更容易扩展上下文。 |
+| LayerNorm | RMSNorm | 只除以均方根、不减均值，计算更省，效果相当。 |
+| GELU MLP | SwiGLU | 带门控的 MLP，同样参数量下效果更好。 |
+| 多头注意力 | GQA（分组查询注意力） | 多个 Q 头共用一组 K、V，生成时要缓存的 K、V 变少，更省显存。 |
+| 直接做点积 | QK-norm | 先把 Q、K 归一化再点积，防止注意力分数过大，训练更稳。 |
+| 线性层带偏置 | 去掉偏置 | 更简洁，效果没有明显损失。 |
+| `wte` 与 `lm_head` 共享 | 常常不共享 | 词表和模型都变大以后，共享省下的比例变小，分开学的表达力更强。 |
+
+阶段 7 计划在同样的规模下，把 GPT-2 结构和这组现代零件逐项对比，见 [Q8.4](#q84-后面会用现代大模型的方法改进-gpt-2-吗)。[LLaMA 论文 §2.2](https://arxiv.org/abs/2302.13971) · [RoPE 论文](https://arxiv.org/abs/2104.09864) · [RMSNorm 论文](https://arxiv.org/abs/1910.07467) · [SwiGLU 论文](https://arxiv.org/abs/2002.05202) · [GQA 论文](https://arxiv.org/abs/2305.13245)
+
+### Q8.4 后面会用现代大模型的方法改进 GPT-2 吗？
+
+**A：** 会，但要先有一个可靠的基线，再分步改，每一步都能说清楚提升来自哪里：
+
+1. **阶段 5**：用本项目选取的训练配置（AdamW、warmup + cosine 学习率、梯度裁剪）在小数据上把训练流程跑通、验对。
+2. **阶段 6**：先做常规加速，比如 bf16 混合精度、`scaled_dot_product_attention`、`torch.compile`。逐项检查吞吐和显存，以及参考输出和 loss 曲线能否在约定容差内对齐。然后从头预训练一个 124M 基线，和官方 124M 比验证 loss 和 HellaSwag。
+3. **阶段 7**：做 2 × 2 对比。结构分 GPT-2 原版和现代结构（RoPE、RMSNorm、SwiGLU、GQA、QK-norm）两种；训练方法分基线的 AdamW + cosine 和现代的 Muon + WSD 两种。Muon 是对权重矩阵的更新做正交化的优化器；WSD 是「预热、长时间保持、最后快速衰减」的学习率安排。对比时 tokenizer、数据、token 预算和参数量都保持一致，并跑多个随机种子，只有超出随机波动的差异才算提升。主指标是训练到基线同等 loss 所需的时间和成本。
+4. **阶段 8（可选）**：在 124M 上做 SFT 和 DPO，把续写模型变成一个会按问答格式回答的迷你聊天模型。
+
+所以「现代方法」分两类：一类是结构上的零件（见 [Q8.3](#q83-现代大模型在-gpt-2-的基础上改了哪些部件)），一类是训练方法。阶段 7 的 2 × 2 对比就是把这两类分开测，看各自贡献多少。
+
 ## 附录 术语表
 
 | 术语 | 含义 |
@@ -768,4 +847,12 @@ GPT-2 去掉了 Encoder 和交叉注意力，只留下带因果遮罩的解码�
 | 权重共享 | 两处网络层共用同一个可训练参数对象；这里指 `wte` 和 `lm_head` 共用一张 `(V, C)` 表。 |
 | 交叉注意力 | 由一条序列提供 Q、另一条序列提供 K 和 V 的注意力，常用于翻译模型的解码器查询原文。 |
 | Decoder-only Transformer | 只堆叠带因果遮罩的解码块、在一条序列上不断预测下一个 token 的 Transformer 架构。 |
+| Post-LayerNorm | 先做残差加法再归一化，写作 `LN(x + branch(x))`，原版 Transformer 和 GPT-1 用这种顺序。 |
+| Encoder-only | 只有编码器、每个位置都能看到左右两边的 Transformer，例如 BERT，适合理解已有文本。 |
+| RNN | 循环神经网络，按顺序一步步读入 token，把前文压缩进一个固定大小的状态。 |
+| RoPE | 旋转位置编码，在注意力里按位置旋转 Q 和 K，让点积带上相对位置信息。 |
+| RMSNorm | 只按均方根缩放、不减均值的归一化，是 LayerNorm 的简化版。 |
+| SwiGLU | 带门控的 MLP 激活方式，现代大模型常用它替代 GELU MLP。 |
+| GQA | 分组查询注意力，多个 Q 头共用一组 K、V，减少生成时的缓存。 |
 | `meta` 设备 | PyTorch 中只记录张量形状与结构、不实际分配内存的虚拟设备，常用于快速核对大模型参数量。 |
+| SDPA | `scaled_dot_product_attention` 的简称，PyTorch 内置的缩放点积注意力加速接口，在 GPU 上可自动调用 FlashAttention 等高效内核。 |

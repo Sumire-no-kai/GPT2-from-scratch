@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class GPT2Embeddings(nn.Module):
@@ -52,10 +53,11 @@ class CausalSelfAttention(nn.Module):
     """按各头的注意力权重汇总当前位置和之前位置的信息。"""
 
     # 设置头数和每头的宽度，建立 Q/K/V 共用的投影层和输出投影层。
-    def __init__(self, embedding_dim: int, num_heads: int) -> None:
+    def __init__(self, embedding_dim: int, num_heads: int, *, use_sdpa: bool = False) -> None:
         """用向量维度 C 和头数 H 创建注意力，要求 C 可被 H 整除。
 
         每头处理 D = C // H 个数。两个线性层的权重形状为 (3C, C) 和 (C, C)。
+        use_sdpa 让 PyTorch 根据输入选择 SDPA 后端，默认走显式的参考实现。
         """
         super().__init__()
         if embedding_dim <= 0 or num_heads <= 0 or embedding_dim % num_heads != 0:
@@ -63,6 +65,7 @@ class CausalSelfAttention(nn.Module):
 
         self.num_heads = num_heads
         self.head_dim = embedding_dim // num_heads
+        self.use_sdpa = use_sdpa
         self.c_attn = nn.Linear(embedding_dim, 3 * embedding_dim)
         self.c_proj = nn.Linear(embedding_dim, embedding_dim)
 
@@ -92,17 +95,23 @@ class CausalSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, D)
         query, key, value = qkv.unbind(dim=0)
 
-        # 每行是一处查询位置，每列是可供比较的一个键位置。
-        transposed_key = key.transpose(-2, -1)  # (B, H, D, T)
-        scores = (query @ transposed_key) / math.sqrt(self.head_dim)  # (B, H, T, T)
+        if self.use_sdpa:
+            # PyTorch 在内核里缩放并施加因果遮罩。关闭 dropout 以对齐参考实现。
+            context = F.scaled_dot_product_attention(
+                query, key, value, dropout_p=0.0, is_causal=True,
+            )  # (B, H, T, D)
+        else:
+            # 每行是一处查询位置，每列是可供比较的一个键位置。
+            transposed_key = key.transpose(-2, -1)  # (B, H, D, T)
+            scores = (query @ transposed_key) / math.sqrt(self.head_dim)  # (B, H, T, T)
 
-        positions = torch.arange(sequence_length, device=x.device)  # (T,)
-        future_mask = positions.unsqueeze(0) > positions.unsqueeze(1)  # (T, T)
-        # 遮罩对所有序列和注意力头生效，未来位置经过 softmax 后的权重为零。
-        scores = scores.masked_fill(future_mask, float("-inf"))  # (B, H, T, T)
-        weights = torch.softmax(scores, dim=-1)  # (B, H, T, T)
+            positions = torch.arange(sequence_length, device=x.device)  # (T,)
+            future_mask = positions.unsqueeze(0) > positions.unsqueeze(1)  # (T, T)
+            # 遮罩对所有序列和注意力头生效，未来位置经过 softmax 后的权重为零。
+            scores = scores.masked_fill(future_mask, float("-inf"))  # (B, H, T, T)
+            weights = torch.softmax(scores, dim=-1)  # (B, H, T, T)
+            context = weights @ value  # (B, H, T, D)
 
-        context = weights @ value  # (B, H, T, D)
         context = context.transpose(1, 2)  # (B, T, H, D)
         context = context.reshape(batch_size, sequence_length, embedding_dim)  # (B, T, C)
         return self.c_proj(context)  # (B, T, C)
@@ -138,11 +147,11 @@ class TransformerBlock(nn.Module):
     """按 GPT-2 的 Pre-LayerNorm 顺序执行注意力和 MLP 两次残差更新。"""
 
     # 给注意力和 MLP 各配一份独立的 LayerNorm，复用已实现的因果自注意力。
-    def __init__(self, embedding_dim: int, num_heads: int) -> None:
-        """用向量维度 C 和头数 H 创建一个 block，每个子模块都接收 C 维向量。"""
+    def __init__(self, embedding_dim: int, num_heads: int, *, use_sdpa: bool = False) -> None:
+        """创建一个接收 C 维向量的 block，并把 use_sdpa 传给注意力层。"""
         super().__init__()
         self.ln_1 = nn.LayerNorm(embedding_dim, eps=1e-5)
-        self.attn = CausalSelfAttention(embedding_dim, num_heads)
+        self.attn = CausalSelfAttention(embedding_dim, num_heads, use_sdpa=use_sdpa)
         self.ln_2 = nn.LayerNorm(embedding_dim, eps=1e-5)
         self.mlp = MLP(embedding_dim)
 
@@ -170,15 +179,18 @@ class GPT2(nn.Module):
         embedding_dim: int = 768,
         num_heads: int = 12,
         num_layers: int = 12,
+        *,
+        use_sdpa: bool = False,
     ) -> None:
-        """默认构建 GPT-2 124M，可传入较小的尺寸进行练习和测试。"""
+        """默认构建 GPT-2 124M，设 use_sdpa=True 让所有 block 使用 SDPA。"""
         super().__init__()
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
 
         self.embeddings = GPT2Embeddings(vocab_size, max_seq_len, embedding_dim)
         self.blocks = nn.ModuleList(
-            TransformerBlock(embedding_dim, num_heads) for _ in range(num_layers)
+            TransformerBlock(embedding_dim, num_heads, use_sdpa=use_sdpa)
+            for _ in range(num_layers)
         )
         self.ln_f = nn.LayerNorm(embedding_dim, eps=1e-5)
         self.lm_head = nn.Linear(embedding_dim, vocab_size, bias=False)

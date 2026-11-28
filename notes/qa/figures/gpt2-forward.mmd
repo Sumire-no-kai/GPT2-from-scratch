@@ -1,0 +1,11 @@
+flowchart TD
+    text["文本 → Tokenizer"] --> ids["Token ID · (B, T)"]
+    ids --> wte["wte · 查 token 向量"]
+    ids -->|"取长度 T"| positions["序列位置 0 到 T - 1"] --> wpe["wpe · 查位置向量"]
+    wte --> add(("+"))
+    wpe --> add
+    add -->|"(B, T, C)"| stack["Transformer block × L（124M 为 12 层）"]
+    stack -->|"(B, T, C)"| ln["ln_f · 最终归一化"]
+    ln --> head["lm_head · 为词表打分"]
+    wte -. "共享权重 (V, C)" .-> head
+    head --> logits["Logits · (B, T, V)"]
